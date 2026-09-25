@@ -1,8 +1,9 @@
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import RuleEngine, valid_grant_window
 
 
 class DomainService:
@@ -56,7 +57,35 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        self._cascade(actor, updated, action, patch)
         return updated
+
+    def _cascade(self, actor, entity, action, patch):
+        if entity["kind"] != "application":
+            return
+        if action == "suspend":
+            # 申请暂停时冻结其名下仍在生效的凭证
+            reason = str(patch.get("reason", ""))
+            grants = self.repository.find_entities("grant", "application_id", entity["id"])
+            for grant in grants:
+                if grant["status"] == "active":
+                    self.transition(
+                        actor,
+                        grant["id"],
+                        "freeze",
+                        {"reason": "application suspended: " + reason},
+                    )
+        elif action == "resume":
+            # 恢复时只放回尚未到期的凭证，已过期的直接标记过期
+            today = datetime.now(timezone.utc).date().isoformat()
+            grants = self.repository.find_entities("grant", "application_id", entity["id"])
+            for grant in grants:
+                if grant["status"] != "frozen":
+                    continue
+                if valid_grant_window(grant["data"].get("expires_at", ""), today):
+                    self.transition(actor, grant["id"], "unfreeze", {})
+                else:
+                    self.transition(actor, grant["id"], "expire", {"expired_at": today})
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

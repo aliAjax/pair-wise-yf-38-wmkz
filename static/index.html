@@ -23,11 +23,33 @@ GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
 POST /api/entities/&lt;id&gt;/actions</pre>
+  <h2>凭证续期与冻结记录</h2>
+  <p><button onclick="loadGrants()">加载凭证记录</button></p>
+  <pre id="grants">尚未加载</pre>
 </main>
 <script>
 async function checkHealth() {
   const response = await fetch('/health');
   document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+}
+
+async function loadGrants() {
+  const response = await fetch('/api/grants');
+  const payload = await response.json();
+  const lines = [];
+  for (const grant of payload.items) {
+    lines.push('凭证 ' + grant.id + ' [' + grant.status + '] 有效期至 ' + (grant.data.expires_at || '-'));
+    lines.push('  续期记录:');
+    for (const item of grant.data.renewals || []) {
+      lines.push('    ' + item.from + ' -> ' + item.to + ' [' + item.status + '] 申请人 ' + item.requested_by + (item.decided_by ? ' 审批人 ' + item.decided_by : ''));
+    }
+    lines.push('  冻结记录:');
+    for (const item of grant.data.freezes || []) {
+      lines.push('    ' + item.event + ' @ ' + item.at + ' 操作人 ' + item.by + (item.reason ? ' 原因 ' + item.reason : ''));
+    }
+    lines.push('');
+  }
+  document.getElementById('grants').textContent = lines.join('\n') || '暂无凭证';
 }
 </script>
 </body>

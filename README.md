@@ -26,6 +26,13 @@ python3 app.py --db ./data.db --port 8304
 
 - `dataset`：受控数据集；`application`：访问申请；`grant`：限时数据使用凭证。
 
+## 凭证生命周期
+
+- `activate`：激活前核对申请已批准，且受让人、数据集、用途与申请一致；凭证期限不得超出申请审批截止；同一申请只允许一张有效凭证（`active`/`frozen`/`renewal_pending`）。
+- `renew`：到期前可续期。新期限在原审批截止内直接生效；超出部分进入`renewal_pending`，由委员会`approve_renewal`/`reject_renewal`裁决，裁决前保留原期限。
+- `suspend`/`resume`（application）：暂停申请会冻结其名下有效凭证；恢复时只放回尚未到期的凭证，已过期的标记为`expired`。
+- 续期与冻结记录保存在凭证的`renewals`/`freezes`字段，并写入审计日志，首页可查看。
+
 ## 主要接口
 
 - `GET /health`：健康检查。

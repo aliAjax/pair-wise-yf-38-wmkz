@@ -6,29 +6,164 @@
   <title>基因组数据访问治理</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
+    main { max-width: 960px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    button { padding: .4rem .8rem; cursor: pointer; margin: .15rem; }
+    input, select { padding: .35rem; margin: .15rem; }
+    table { border-collapse: collapse; width: 100%; margin: .5rem 0 1.5rem; }
+    th, td { border: 1px solid #d1d5db; padding: .4rem .6rem; text-align: left; font-size: .9rem; }
+    th { background: #f9fafb; }
+    .status-active, .status-approved { color: #047857; font-weight: 600; }
+    .status-frozen, .status-suspended { color: #b45309; font-weight: 600; }
+    .status-expired, .status-revoked { color: #b91c1c; }
+    h2 { margin-top: 2rem; }
+    .muted { color: #6b7280; font-size: .85rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>基因组数据访问治理</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
-  <h2>常用接口</h2>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+  <p class="muted">凭证生命周期演示：激活核对、到期续期、申请暂停联动冻结、恢复只放回未到期凭证。</p>
+
+  <h2>申请</h2>
+  <table id="applications">
+    <thead><tr><th>ID</th><th>状态</th><th>申请人</th><th>用途</th><th>审批截止</th><th>操作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>凭证</h2>
+  <table id="grants">
+    <thead><tr><th>ID</th><th>状态</th><th>受让人</th><th>生效</th><th>到期</th><th>操作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>续期与冻结记录</h2>
+  <p class="muted">仅显示续期（renew）、冻结（freeze）、解冻（unfreeze）、到期（expire）相关审计。</p>
+  <table id="records">
+    <thead><tr><th>时间</th><th>对象</th><th>动作</th><th>状态变化</th><th>操作人</th><th>详情</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>全部审计</h2>
+  <pre id="audit">加载中…</pre>
 </main>
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+const RECORD_ACTIONS = new Set(['renew', 'freeze', 'unfreeze', 'expire']);
+const headers = {'Content-Type': 'application/json', 'X-User-Id': 'demo-admin', 'X-Role': 'admin'};
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const body = await response.json();
+  if (!response.ok) {
+    alert(body.error || response.statusText);
+    throw new Error(body.error || response.statusText);
+  }
+  return body;
 }
+
+async function act(id, action, data) {
+  await api('/api/entities/' + id + '/actions', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({action, data: data || {}}),
+  });
+  await refresh();
+}
+
+function short(id) { return id.slice(0, 8); }
+
+function renderApplications(items) {
+  const tbody = document.querySelector('#applications tbody');
+  tbody.innerHTML = '';
+  for (const app of items) {
+    const tr = document.createElement('tr');
+    const cutoff = app.data.expires_at || '-';
+    tr.innerHTML = '<td title="' + app.id + '">' + short(app.id) + '</td>' +
+      '<td class="status-' + app.status + '">' + app.status + '</td>' +
+      '<td>' + (app.data.applicant_id || '') + '</td>' +
+      '<td>' + (app.data.purpose || '') + '</td>' +
+      '<td>' + cutoff + '</td><td></td>';
+    const ops = tr.lastElementChild;
+    if (app.status === 'approved') {
+      ops.appendChild(button('暂停', () => {
+        const reason = prompt('暂停原因', '合规复查');
+        if (reason !== null) act(app.id, 'suspend', {reason});
+      }));
+      ops.appendChild(button('委员会重新批准', () => {
+        const newCutoff = prompt('新的审批截止日期（需 3 名不同委员批准）', app.data.expires_at);
+        if (newCutoff !== null) {
+          act(app.id, 'reapprove', {
+            approvals: ['r1', 'r2', 'r3'], expires_at: newCutoff,
+          });
+        }
+      }));
+    }
+    if (app.status === 'suspended') {
+      ops.appendChild(button('恢复', () => act(app.id, 'resume', {})));
+    }
+    tbody.appendChild(tr);
+  }
+}
+
+function renderGrants(items) {
+  const tbody = document.querySelector('#grants tbody');
+  tbody.innerHTML = '';
+  for (const grant of items) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td title="' + grant.id + '">' + short(grant.id) + '</td>' +
+      '<td class="status-' + grant.status + '">' + grant.status + '</td>' +
+      '<td>' + (grant.data.recipient || '') + '</td>' +
+      '<td>' + (grant.data.starts_at || '-') + '</td>' +
+      '<td>' + (grant.data.expires_at || '-') + '</td><td></td>';
+    const ops = tr.lastElementChild;
+    if (grant.status === 'active') {
+      ops.appendChild(button('续期', () => {
+        const newExpires = prompt('新到期日（不得超过原审批截止）', grant.data.expires_at);
+        if (newExpires) act(grant.id, 'renew', {new_expires_at: newExpires});
+      }));
+    }
+    tbody.appendChild(tr);
+  }
+}
+
+function renderRecords(items) {
+  const tbody = document.querySelector('#records tbody');
+  tbody.innerHTML = '';
+  for (const item of items.filter(i => RECORD_ACTIONS.has(i.action))) {
+    const tr = document.createElement('tr');
+    const detail = item.detail && item.detail.patch ? JSON.stringify(item.detail.patch) : '';
+    tr.innerHTML = '<td>' + item.created_at + '</td>' +
+      '<td title="' + item.entity_id + '">' + short(item.entity_id) + '</td>' +
+      '<td>' + item.action + '</td>' +
+      '<td>' + (item.from_status || '-') + ' → ' + item.to_status + '</td>' +
+      '<td>' + item.actor_id + '</td>' +
+      '<td class="muted">' + detail + '</td>';
+    tbody.appendChild(tr);
+  }
+}
+
+function button(label, onclick) {
+  const btn = document.createElement('button');
+  btn.textContent = label;
+  btn.onclick = onclick;
+  return btn;
+}
+
+async function refresh() {
+  const [applications, grants, audit] = await Promise.all([
+    api('/api/applications'),
+    api('/api/grants'),
+    api('/api/audit'),
+  ]);
+  renderApplications(applications.items);
+  renderGrants(grants.items);
+  renderRecords(audit.items);
+  document.getElementById('audit').textContent = JSON.stringify(audit.items, null, 2);
+}
+
+refresh().catch(err => {
+  document.getElementById('audit').textContent = '加载失败：' + err.message;
+});
 </script>
 </body>
 </html>

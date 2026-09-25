@@ -2,7 +2,8 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import RuleEngine, valid_grant_window
+from .repository import utcnow
 
 
 class DomainService:
@@ -56,7 +57,61 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if entity["kind"] == "application":
+            if action == "suspend":
+                self._freeze_application_grants(actor, updated, patch.get("reason"))
+            elif action == "resume":
+                self._restore_application_grants(actor, updated)
         return updated
+
+    def _freeze_application_grants(self, actor, application, reason):
+        for grant in self.repository.list_entities(kind="grant", status="active"):
+            if grant["data"].get("application_id") != application["id"]:
+                continue
+            _, patch = self.rules.validate_transition(
+                actor, grant, "freeze", {"reason": reason or ""}, self._lookup
+            )
+            merged = dict(grant["data"])
+            merged.update(patch)
+            self.repository.update_entity(
+                grant["id"], grant["version"], "frozen", merged
+            )
+            self.audit.record(
+                grant["id"], actor, "freeze", "active", "frozen", {"patch": patch}
+            )
+
+    def _restore_application_grants(self, actor, application):
+        today = utcnow()[:10]
+        for grant in self.repository.list_entities(kind="grant", status="frozen"):
+            if grant["data"].get("application_id") != application["id"]:
+                continue
+            if not valid_grant_window(grant["data"].get("expires_at"), today):
+                merged = dict(grant["data"])
+                merged["expired_at"] = today
+                self.repository.update_entity(
+                    grant["id"], grant["version"], "expired", merged
+                )
+                self.audit.record(
+                    grant["id"],
+                    actor,
+                    "expire",
+                    "frozen",
+                    "expired",
+                    {"patch": {"expired_at": today}, "reason": "expired while frozen"},
+                )
+                continue
+            _, patch = self.rules.validate_transition(
+                actor, grant, "unfreeze", {}, self._lookup
+            )
+            merged = dict(grant["data"])
+            merged.update(patch)
+            self.repository.update_entity(
+                grant["id"], grant["version"], "active", merged
+            )
+            self.audit.record(
+                grant["id"], actor, "unfreeze", "frozen", "active", {"patch": patch}
+            )
+
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

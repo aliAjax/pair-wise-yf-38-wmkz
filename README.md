@@ -26,6 +26,13 @@ python3 app.py --db ./data.db --port 8304
 
 - `dataset`：受控数据集；`application`：访问申请；`grant`：限时数据使用凭证。
 
+## 凭证治理规则
+
+- **激活核对**：`grant/activate` 时关联申请必须为 `approved`；凭证的受让人（`recipient`）、数据集（`dataset_id`）、用途（`purpose`）必须与申请一致；凭证期限不得超过审批截止（申请的 `expires_at`）。同一申请只允许一张 `active` 凭证。
+- **到期续期**：仅 `active` 且尚未到期的凭证可 `renew`，新期限必须晚于当前到期日，且不能超过原审批截止（申请的 `original_expires_at`）。超出审批截止的续期会被拒绝，须先由委员会对申请执行 `reapprove`（同样需要三名不同委员批准并延长审批截止）；落在原审批截止之外的续期会被标记 `beyond_original_approval`。
+- **暂停与恢复**：申请 `suspend` 后，其所有 `active` 凭证自动 `freeze`；`resume` 后仅尚未到期的凭证 `unfreeze` 回 `active`，已过期的凭证直接置为 `expired`，不会放回。
+- **操作留痕**：续期、冻结、解冻、到期等动作全部写入审计时间线，可通过 `GET /api/audit?entity_id=<id>` 或演示页面查看。
+
 ## 主要接口
 
 - `GET /health`：健康检查。

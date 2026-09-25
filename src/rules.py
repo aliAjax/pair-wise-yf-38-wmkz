@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime
 
 from .domain import (
     ConflictError,
@@ -6,6 +6,17 @@ from .domain import (
     PermissionDenied,
     ValidationError,
 )
+
+
+def _today():
+    return date.today().isoformat()
+
+
+def _parse_date(value, field):
+    try:
+        return datetime.fromisoformat(str(value)[:10]).date()
+    except (TypeError, ValueError):
+        raise ValidationError("invalid date for %s: %s" % (field, value))
 
 
 def _validate_dataset(actor, data, lookup):
@@ -21,36 +32,207 @@ def _validate_application(actor, data, lookup):
         raise ValidationError("purpose is required")
 
 
+def _validate_grant_create(actor, data, lookup):
+    application = _find_one(lookup, "application", "id", data.get("application_id"))
+    if not application:
+        raise ValidationError("application does not exist")
+    _ensure_consistent_with_application(application, data)
+
+
 def _validate_approve(actor, entity, data, lookup):
     approvals = data.get("approvals") or []
     if len(set(approvals)) < 3:
         raise ValidationError("at least three distinct committee approvals are required")
     if data.get("conflict_of_interest"):
         raise PermissionDenied("conflicted reviewer cannot approve access")
+    return {"original_expires_at": data.get("expires_at")}
+
+
+def _validate_reapprove(actor, entity, data, lookup):
+    approvals = data.get("approvals") or []
+    if len(set(approvals)) < 3:
+        raise ValidationError("at least three distinct committee approvals are required")
+    if data.get("conflict_of_interest"):
+        raise PermissionDenied("conflicted reviewer cannot approve access")
+    current_cutoff = (entity.get("data") or {}).get("expires_at")
+    new_cutoff = _parse_date(data.get("expires_at"), "expires_at")
+    if current_cutoff and new_cutoff <= _parse_date(current_cutoff, "expires_at"):
+        raise ValidationError("re-approval must extend the approval cutoff")
+    return {"reapproved_by": actor.user_id, "reapproved_at": _today()}
+
+
+def _validate_grant_activate(actor, entity, data, lookup):
+    grant = entity.get("data") or {}
+    starts_at = _parse_date(data.get("starts_at"), "starts_at")
+    expires_at = _parse_date(data.get("expires_at"), "expires_at")
+    if expires_at < starts_at:
+        raise ValidationError("grant expiry must be after start")
+    application = _find_one(lookup, "application", "id", grant.get("application_id"))
+    if not application:
+        raise ValidationError("linked application does not exist")
+    if application["status"] != "approved":
+        raise InvalidTransition(
+            "application must be approved before activation (status: %s)"
+            % application["status"]
+        )
+    _ensure_consistent_with_application(application, grant)
+    cutoff = (application.get("data") or {}).get("expires_at")
+    if cutoff and expires_at > _parse_date(cutoff, "expires_at"):
+        raise ValidationError("grant expiry exceeds the approved cutoff")
+    for sibling in lookup("grant", "application_id", grant.get("application_id")) or []:
+        if sibling["id"] != entity["id"] and sibling["status"] == "active":
+            raise ConflictError(
+                "application already has an active grant: " + sibling["id"]
+            )
+    return {"activated_by": actor.user_id}
+
+
+def _validate_grant_renew(actor, entity, data, lookup):
+    grant = entity.get("data") or {}
+    today = date.today()
+    current_expiry = _parse_date(grant.get("expires_at"), "expires_at")
+    if current_expiry < today:
+        raise InvalidTransition("grant already expired and cannot be renewed")
+    new_expiry = _parse_date(data.get("new_expires_at"), "new_expires_at")
+    if new_expiry <= current_expiry:
+        raise ValidationError("new expiry must be later than the current expiry")
+    application = _find_one(lookup, "application", "id", grant.get("application_id"))
+    if not application:
+        raise ValidationError("linked application does not exist")
+    app_data = application.get("data") or {}
+    cutoff = app_data.get("expires_at")
+    if cutoff and new_expiry > _parse_date(cutoff, "expires_at"):
+        raise ValidationError(
+            "renewal exceeds the approved cutoff %s; "
+            "the excess requires committee re-approval" % cutoff
+        )
+    extra = {
+        "expires_at": data.get("new_expires_at"),
+        "renewed_by": actor.user_id,
+        "renewed_at": _today(),
+    }
+    original_cutoff = app_data.get("original_expires_at")
+    if original_cutoff and new_expiry > _parse_date(original_cutoff, "original_expires_at"):
+        extra["beyond_original_approval"] = True
+    return extra
+
+
+def _validate_grant_freeze(actor, entity, data, lookup):
+    grant = entity.get("data") or {}
+    application = _find_one(lookup, "application", "id", grant.get("application_id"))
+    if not application or application["status"] != "suspended":
+        raise InvalidTransition("grant can only be frozen while its application is suspended")
+    return {"frozen_by": actor.user_id, "frozen_at": _today()}
+
+
+def _validate_grant_unfreeze(actor, entity, data, lookup):
+    grant = entity.get("data") or {}
+    application = _find_one(lookup, "application", "id", grant.get("application_id"))
+    if not application or application["status"] != "approved":
+        raise InvalidTransition("grant can only be unfrozen after its application resumes")
+    if not valid_grant_window(grant.get("expires_at"), _today()):
+        raise InvalidTransition("grant already expired and cannot be unfrozen")
+    return {"unfrozen_by": actor.user_id, "unfrozen_at": _today()}
+
+
+def _ensure_consistent_with_application(application, grant_data):
+    app_data = application.get("data") or {}
+    if grant_data.get("recipient") != app_data.get("applicant_id"):
+        raise ValidationError("grant recipient must match the application applicant")
+    if grant_data.get("dataset_id") != app_data.get("dataset_id"):
+        raise ValidationError("grant dataset must match the application dataset")
+    purpose = str(grant_data.get("purpose") or "").strip()
+    if purpose != str(app_data.get("purpose") or "").strip():
+        raise ValidationError("grant purpose must match the application purpose")
 
 
 def valid_grant_window(expires_at, as_of):
     return str(expires_at) >= str(as_of)
 
 
-def _validate_grant_activate(actor, entity, data, lookup):
-    if data.get("expires_at") < data.get("starts_at"):
-        raise ValidationError("grant expiry must be after start")
-    return {"activated_by": actor.user_id}
-
-
-CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application}
-CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate}
+CUSTOM_CREATE = {
+    "dataset": _validate_dataset,
+    "application": _validate_application,
+    "grant": _validate_grant_create,
+}
+CUSTOM_TRANSITIONS = {
+    ("application", "approve"): _validate_approve,
+    ("application", "reapprove"): _validate_reapprove,
+    ("grant", "activate"): _validate_grant_activate,
+    ("grant", "renew"): _validate_grant_renew,
+    ("grant", "freeze"): _validate_grant_freeze,
+    ("grant", "unfreeze"): _validate_grant_unfreeze,
+}
 
 
 class RuleEngine:
-    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant'}
-    INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued'}
-    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}}
-    CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient')}
-    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',)}
-    CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee')}
-    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee')}
+    ALIASES = {"datasets": "dataset", "applications": "application", "grants": "grant"}
+    INITIAL_STATUS = {"dataset": "registered", "application": "draft", "grant": "issued"}
+    TRANSITIONS = {
+        "dataset": {
+            "restrict": (("registered",), "restricted"),
+            "publish": (("restricted",), "published"),
+        },
+        "application": {
+            "submit": (("draft",), "submitted"),
+            "review": (("submitted",), "under_review"),
+            "approve": (("under_review",), "approved"),
+            "reapprove": (("approved",), "approved"),
+            "reject": (("under_review",), "rejected"),
+            "withdraw": (("submitted", "under_review"), "withdrawn"),
+            "suspend": (("approved",), "suspended"),
+            "resume": (("suspended",), "approved"),
+        },
+        "grant": {
+            "activate": (("issued",), "active"),
+            "renew": (("active",), "active"),
+            "freeze": (("active",), "frozen"),
+            "unfreeze": (("frozen",), "active"),
+            "revoke": (("active",), "revoked"),
+            "expire": (("active", "frozen"), "expired"),
+        },
+    }
+    CREATE_REQUIRED = {
+        "dataset": ("name", "access_policy"),
+        "application": ("dataset_id", "applicant_id", "purpose"),
+        "grant": ("application_id", "dataset_id", "recipient", "purpose"),
+    }
+    ACTION_REQUIRED = {
+        ("dataset", "restrict"): ("reason",),
+        ("application", "review"): ("committee_id",),
+        ("application", "approve"): ("approvals", "terms", "expires_at"),
+        ("application", "reapprove"): ("approvals", "expires_at"),
+        ("application", "reject"): ("reason",),
+        ("application", "withdraw"): ("reason",),
+        ("application", "suspend"): ("reason",),
+        ("grant", "activate"): ("starts_at", "expires_at"),
+        ("grant", "renew"): ("new_expires_at",),
+        ("grant", "revoke"): ("reason",),
+        ("grant", "expire"): ("expired_at",),
+    }
+    CREATE_ROLES = {
+        "dataset": ("admin", "committee"),
+        "application": ("admin", "applicant"),
+        "grant": ("admin", "committee"),
+    }
+    ROLE_ACTIONS = {
+        "restrict": ("admin", "committee"),
+        "publish": ("admin", "committee"),
+        "submit": ("admin", "applicant"),
+        "review": ("admin", "committee"),
+        "approve": ("admin", "committee"),
+        "reapprove": ("admin", "committee"),
+        "reject": ("admin", "committee"),
+        "withdraw": ("admin", "applicant"),
+        "suspend": ("admin", "committee"),
+        "resume": ("admin", "committee"),
+        "activate": ("admin", "committee"),
+        "renew": ("admin", "committee"),
+        "freeze": ("admin", "committee"),
+        "unfreeze": ("admin", "committee"),
+        "revoke": ("admin", "committee"),
+        "expire": ("admin", "committee"),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
